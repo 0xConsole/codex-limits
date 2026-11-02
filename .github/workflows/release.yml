@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build the universal app and CLI
+        env:
+          ARCHS: arm64 x86_64
+        run: |
+          ./scripts/build-app.sh
+          swift build -c release --product codex-limits --arch arm64 --arch x86_64
+          bin_dir=$(swift build -c release --product codex-limits --arch arm64 --arch x86_64 --show-bin-path)
+          mkdir -p artifacts
+          ditto -c -k --keepParent "dist/Codex Limits.app" "artifacts/CodexLimits-${GITHUB_REF_NAME}-macos.zip"
+          tar -C "$bin_dir" -czf "artifacts/codex-limits-${GITHUB_REF_NAME}-macos-universal.tar.gz" codex-limits
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos
+          path: artifacts/*
+
+  linux:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    # Ubuntu 22.04's glibc keeps the binary working on most current distributions.
+    container: swift:6.2-jammy
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build the CLI
+        run: |
+          swift build -c release --product codex-limits --static-swift-stdlib
+          bin_dir=$(swift build -c release --product codex-limits --static-swift-stdlib --show-bin-path)
+          mkdir -p artifacts
+          tar -C "$bin_dir" -czf "artifacts/codex-limits-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}.tar.gz" codex-limits
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: artifacts/*
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: compnerd/gha-setup-swift@9ff1ee4c44888c5817fc14d1b257ac8cabb4935f # v0.5.1
+        with:
+          swift-version: swift-6.2.1-release
+          swift-build: 6.2.1-RELEASE
+      - name: Build the CLI
+        shell: pwsh
+        run: |
+          swift build -c release --product codex-limits
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bin = swift build -c release --product codex-limits --show-bin-path
+          New-Item -ItemType Directory -Force -Path package, artifacts | Out-Null
+          Copy-Item "$bin\codex-limits.exe" package\
+          # Swift's runtime is not linked statically on Windows, so ship its DLLs too.
+          $runtime = Split-Path (where.exe swiftCore.dll | Select-Object -First 1)
+          Copy-Item "$runtime\*.dll" package\
+          Compress-Archive -Path package\* -DestinationPath "artifacts\codex-limits-$env:GITHUB_REF_NAME-windows-x86_64.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows
+          path: artifacts/*
+
+  publish:
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Codex Limits $GITHUB_REF_NAME" \
+            --generate-notes

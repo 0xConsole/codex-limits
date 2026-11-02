@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Test
+        run: swift test
+      - name: Build the menu-bar app
+        run: ./scripts/build-app.sh
+
+  linux:
+    runs-on: ubuntu-latest
+    container: swift:6.2-jammy
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install python3 for the fake Codex servers the tests start
+        run: apt-get update && apt-get install -y --no-install-recommends python3
+      - name: Test
+        run: swift test
+      - name: Build the CLI
+        run: swift build -c release --product codex-limits
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: compnerd/gha-setup-swift@9ff1ee4c44888c5817fc14d1b257ac8cabb4935f # v0.5.1
+        with:
+          swift-version: swift-6.2.1-release
+          swift-build: 6.2.1-RELEASE
+      - name: Test
+        run: swift test
+      - name: Build the CLI
+        run: swift build -c release --product codex-limits
