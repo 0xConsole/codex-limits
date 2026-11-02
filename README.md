@@ -20,8 +20,9 @@ Adding or refreshing an account never changes the account Codex is signed in to.
 1. It watches the account Codex is signed in to. Nothing happens until a fresh quota read confirms that account is blocked by a usage limit.
 2. It finds the most recent conversation, from the last 24 hours, whose latest turn failed with Codex's usage-limit error.
 3. It waits until a saved account's 5-hour window has fully replenished: 100% left, with Codex reporting that the account may be used. Quota left over in a partly used window does not count. If more than one account qualifies, it prefers the one Codex already uses, then the one with the most weekly quota left.
-4. It signs Codex in to that account and continues the conversation where it stopped.
+4. It signs Codex in to that account and continues the conversation where it stopped. If the conversation has a goal that Codex stopped because of the limit, it makes the goal active again first, so Codex carries on working toward it.
 5. If that account runs out too, it waits for the next replenished account and continues the same conversation.
+6. If Codex can't run the continuation for a temporary reason, such as the model being at capacity or a dropped connection, it keeps the conversation and tries again after 1, 2, 4 and 8 minutes, then every 15 minutes.
 
 A journal records each continuation, so Auto Resume never starts the same continuation twice, even after a crash or restart.
 

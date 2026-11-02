@@ -58,6 +58,7 @@ struct LimitsMenuView: View {
                     Text(status)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
                 }
                 .padding(10)
@@ -76,6 +77,7 @@ struct LimitsMenuView: View {
                     Text(status)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
                 }
                 .padding(10)

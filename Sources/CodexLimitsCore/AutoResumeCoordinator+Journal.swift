@@ -111,7 +111,9 @@ extension AutoResumeCoordinator {
         return candidates
     }
 
-    func usageLimitedContinuationCandidates(
+    /// Continuations Auto Resume ran that ended on the usage limit or a temporary Codex
+    /// failure, while they are still the conversation's latest turn.
+    func stoppedContinuationCandidates(
         scanner: CodexAppServerClient,
         journal: AutoResumeJournal
     ) async throws -> [AutoResumeCandidate] {
@@ -123,14 +125,15 @@ extension AutoResumeCoordinator {
 
         var candidates: [AutoResumeCandidate] = []
         var seenTurnIDs = Set<String>()
-        for record in journal.records where record.status == .consumed && record.errorInfo == "usageLimitExceeded" {
-            guard let destinationTurnID = record.destinationTurnID,
+        for record in journal.records where record.status == .consumed {
+            guard let errorInfo = record.errorInfo,
+                  errorInfo == "usageLimitExceeded" || Self.temporaryTurnErrors.contains(errorInfo),
+                  let destinationTurnID = record.destinationTurnID,
                   !alreadyClaimed.contains(destinationTurnID),
                   seenTurnIDs.insert(destinationTurnID).inserted,
                   let latest = try await scanner.latestTurn(threadID: record.destinationThreadID),
                   latest["id"]?.stringValue == destinationTurnID,
-                  latest["status"]?.stringValue == "failed",
-                  latest["error"]?["codexErrorInfo"]?.stringValue == "usageLimitExceeded"
+                  Self.isStoppedByLimitOrTemporaryFailure(latest)
             else { continue }
 
             candidates.append(

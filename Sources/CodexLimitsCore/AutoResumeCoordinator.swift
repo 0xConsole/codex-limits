@@ -7,6 +7,7 @@ public enum AutoResumeError: LocalizedError, Sendable {
     case noRecentQuotaStoppedThreads
     case accountIdentityChanged
     case threadWriterBusy(String)
+    case temporaryCodexError(String)
     case destinationTurnFailed(String)
 
     public var errorDescription: String? {
@@ -23,6 +24,8 @@ public enum AutoResumeError: LocalizedError, Sendable {
             return "Codex is not signed in to the account Auto Resume switched to. Sign in to that account again in Codex Limits."
         case .threadWriterBusy(let threadID):
             return "Codex Desktop ownership changed while Auto Resume was preparing conversation \(threadID). It will revalidate and retry instead of silently skipping it."
+        case .temporaryCodexError(let message):
+            return "Codex couldn't continue the conversation right now: \(message)"
         case .destinationTurnFailed(let message):
             return message
         }
@@ -86,7 +89,7 @@ public actor AutoResumeCoordinator {
 
         let interrupted = try await interruptedContinuationCandidates(scanner: scanner, journal: journal)
         let interruptedThreadIDs = Set(interrupted.map(\.sourceThreadID))
-        let durable = try await usageLimitedContinuationCandidates(scanner: scanner, journal: journal)
+        let durable = try await stoppedContinuationCandidates(scanner: scanner, journal: journal)
         let recent = try await recentUsageLimitedCandidates(scanner: scanner, journal: journal)
         let usageLimited = Self.uniqueCandidates(recent + durable + additionalCandidates)
             .filter { !interruptedThreadIDs.contains($0.sourceThreadID) }
@@ -129,8 +132,12 @@ public actor AutoResumeCoordinator {
         var owner: DesktopThreadOwner?
         do {
             guard let preflightTurn = try await scanner.latestTurn(threadID: threadID),
-                  await Self.stillStops(at: candidate, isInterrupted: isInterrupted, latestTurn: preflightTurn, scanner: scanner)
+                  Self.isContinuationBoundary(preflightTurn, of: candidate, isInterrupted: isInterrupted)
             else { return false }
+
+            // Before this app-server takes the conversation: activating a goal on a
+            // conversation it hosts makes Codex start a goal turn of its own at once.
+            await reactivateStoppedGoal(threadID: threadID, latestTurn: preflightTurn, scanner: scanner, progress: progress)
 
             // Prefer Desktop custody even when the conversation is not open. A standalone
             // writer makes Desktop show "This is open in another app" and cannot join its
@@ -214,16 +221,16 @@ public actor AutoResumeCoordinator {
                 try saveJournal(journal)
             }
 
-            if outcome.status == "failed", outcome.errorInfo == "usageLimitExceeded" {
-                guard await shouldContinue() else { return false }
-                // The failed turn is the new continuation boundary. Release this
-                // app-server and let the caller wait for a replenished 5-hour window.
-                await scanner.stop()
-                throw AutoResumeError.waitingForFiveHourReplenishment(account.email)
-            }
-            guard outcome.status == "completed" else {
-                let detail = outcome.errorMessage ?? outcome.errorInfo ?? "Codex returned \(outcome.status)."
-                throw AutoResumeError.destinationTurnFailed("Auto Resume stopped: \(detail)")
+            try await stopUnlessCompleted(outcome, account: account, scanner: scanner, shouldContinue: shouldContinue)
+            if owner == nil {
+                try await followGoalTurns(
+                    after: turnID,
+                    threadID: threadID,
+                    account: account,
+                    journal: &journal,
+                    scanner: scanner,
+                    shouldContinue: shouldContinue
+                )
             }
             return true
         } catch {
@@ -319,34 +326,155 @@ public actor AutoResumeCoordinator {
         try? await desktopIPC.unfollowThread(threadID: threadID, ownerClientID: owner.clientID)
     }
 
-    /// Whether the conversation still ends on the turn Auto Resume is continuing from.
-    private static func stillStops(
-        at candidate: AutoResumeCandidate,
-        isInterrupted: Bool,
-        latestTurn: JSONValue,
-        scanner: CodexAppServerClient
-    ) async -> Bool {
-        if isInterrupted {
-            return latestTurn["id"]?.stringValue == candidate.failedTurnID
-                && latestTurn["status"]?.stringValue == "interrupted"
+    /// Throws when a continuation turn ended without completing: the usage limit means
+    /// waiting for another replenished account, a temporary Codex failure means trying
+    /// again shortly, and anything else stops this pass.
+    private func stopUnlessCompleted(
+        _ outcome: CodexTurnOutcome,
+        account: SavedAccount,
+        scanner: CodexAppServerClient,
+        shouldContinue: @Sendable () async -> Bool
+    ) async throws {
+        if outcome.status == "failed", outcome.errorInfo == "usageLimitExceeded" {
+            guard await shouldContinue() else { throw CancellationError() }
+            // The failed turn is the new continuation boundary. Release this
+            // app-server and let the caller wait for a replenished 5-hour window.
+            await scanner.stop()
+            throw AutoResumeError.waitingForFiveHourReplenishment(account.email)
         }
-        let fresh = await scanner.usageLimitedCandidate(
-            thread: .object([
-                "id": .string(candidate.sourceThreadID),
-                "updatedAt": candidate.updatedAt.map { .number($0.timeIntervalSince1970) } ?? .null,
-            ]),
-            latestTurn: latestTurn
-        )
-        return fresh?.failedTurnID == candidate.failedTurnID
+        if outcome.status == "failed", let code = outcome.errorInfo, Self.temporaryTurnErrors.contains(code) {
+            throw AutoResumeError.temporaryCodexError(outcome.errorMessage ?? code)
+        }
+        guard outcome.status == "completed" else {
+            let detail = outcome.errorMessage ?? outcome.errorInfo ?? "Codex returned \(outcome.status)."
+            throw AutoResumeError.destinationTurnFailed("Auto Resume stopped: \(detail)")
+        }
     }
 
+    /// On the direct path this app-server hosts the conversation. With an active goal,
+    /// Codex starts the next turn itself as soon as one ends, so keep hosting while it
+    /// does: stopping this app-server would cut that goal turn off.
+    private func followGoalTurns(
+        after turnID: String,
+        threadID: String,
+        account: SavedAccount,
+        journal: inout AutoResumeJournal,
+        scanner: CodexAppServerClient,
+        shouldContinue: @Sendable () async -> Bool
+    ) async throws {
+        var previousTurnID = turnID
+        while await shouldContinue(),
+              (try? await scanner.threadGoal(threadID: threadID))?["status"]?.stringValue == "active",
+              let nextTurnID = try await turn(after: previousTurnID, threadID: threadID, scanner: scanner) {
+            let outcome = try await scanner.waitForTurnCompletion(threadID: threadID, turnID: nextTurnID)
+            if outcome.status == "failed" {
+                // Record the hosted turn so the journal can pick the conversation up
+                // again from it, as it does for continuations Auto Resume starts.
+                journal.records.append(
+                    AutoResumeRecord(
+                        sourceThreadID: threadID,
+                        sourceTurnID: previousTurnID,
+                        destinationThreadID: threadID,
+                        destinationTurnID: nextTurnID,
+                        accountID: account.id,
+                        status: .consumed,
+                        errorInfo: outcome.errorInfo,
+                        createdAt: Date()
+                    )
+                )
+                try saveJournal(journal)
+            }
+            try await stopUnlessCompleted(outcome, account: account, scanner: scanner, shouldContinue: shouldContinue)
+            previousTurnID = nextTurnID
+        }
+    }
+
+    /// A turn Codex started after `turnID`, if one begins within a few seconds.
+    private func turn(after turnID: String, threadID: String, scanner: CodexAppServerClient) async throws -> String? {
+        let deadline = Date().addingTimeInterval(Self.goalContinuationGrace)
+        while Date() < deadline {
+            if let latestID = try await scanner.latestTurn(threadID: threadID)?["id"]?.stringValue,
+               latestID != turnID {
+                return latestID
+            }
+            try await Task.sleep(for: .seconds(1))
+        }
+        return nil
+    }
+
+    /// Codex stops a conversation's goal when the usage limit ends its turn, and blocks it
+    /// when a turn fails for good. Left that way, the goal stops again after this one
+    /// continuation, so Auto Resume makes it active first.
+    private func reactivateStoppedGoal(
+        threadID: String,
+        latestTurn: JSONValue,
+        scanner: CodexAppServerClient,
+        progress: @Sendable (String) async -> Void
+    ) async {
+        guard let goal = try? await scanner.threadGoal(threadID: threadID),
+              Self.goalNeedsReactivation(status: goal["status"]?.stringValue, latestTurn: latestTurn)
+        else { return }
+        do {
+            try await scanner.setThreadGoalStatus(threadID: threadID, status: "active")
+            await progress("Resuming the conversation's goal…")
+        } catch {
+            // The continuation still runs; the goal can be resumed in Codex by hand.
+        }
+    }
+
+    /// A goal the usage limit stopped is resumed. A blocked goal is resumed only when a
+    /// temporary failure of the turn being continued blocked it; Codex blocks goals on
+    /// lasting errors on purpose, to keep them from looping.
+    static func goalNeedsReactivation(status: String?, latestTurn: JSONValue) -> Bool {
+        switch status {
+        case "usageLimited":
+            return true
+        case "blocked":
+            return latestTurn["status"]?.stringValue == "failed" && isTemporaryFailure(latestTurn)
+        default:
+            return false
+        }
+    }
+
+    /// Codex errors that end a turn but say nothing about the account, such as an
+    /// overloaded model or a dropped connection. Trying again later is the remedy.
+    static let temporaryTurnErrors: Set<String> = [
+        "serverOverloaded",
+        "rateLimitExceeded",
+        "internalServerError",
+        "httpConnectionFailed",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+    ]
+
+    /// How long to wait for Codex to start a goal's next turn on its own.
+    static let goalContinuationGrace: TimeInterval = 15
+
+    static func isTemporaryFailure(_ turn: JSONValue) -> Bool {
+        guard let code = turn["error"]?["codexErrorInfo"]?.codexErrorCode else { return false }
+        return temporaryTurnErrors.contains(code)
+    }
+
+    /// The wait before retrying after `attempt` temporary failures in a row: one minute,
+    /// doubling up to 15 minutes.
+    public static func temporaryFailureRetryDelay(attempt: Int) -> TimeInterval {
+        min(15 * 60, 60 * pow(2, Double(max(0, attempt - 1))))
+    }
+
+    /// Whether `turn` is still where the candidate stopped: the same turn, ended by the
+    /// usage limit or a temporary Codex failure, or interrupted for an interrupted candidate.
     static func isContinuationBoundary(_ turn: JSONValue, of candidate: AutoResumeCandidate, isInterrupted: Bool) -> Bool {
         guard turn["id"]?.stringValue == candidate.failedTurnID else { return false }
         if isInterrupted {
             return turn["status"]?.stringValue == "interrupted"
         }
-        return turn["status"]?.stringValue == "failed"
-            && turn["error"]?["codexErrorInfo"]?.stringValue == "usageLimitExceeded"
+        return isStoppedByLimitOrTemporaryFailure(turn)
+    }
+
+    static func isStoppedByLimitOrTemporaryFailure(_ turn: JSONValue) -> Bool {
+        turn["status"]?.stringValue == "failed"
+            && (turn["error"]?["codexErrorInfo"]?.codexErrorCode == "usageLimitExceeded" || isTemporaryFailure(turn))
     }
 
     static func isActiveWriterError(_ error: Error) -> Bool {
@@ -429,7 +557,7 @@ public actor AutoResumeCoordinator {
             selectedChainThreadIDs.isEmpty || selectedChainThreadIDs.contains($0.sourceThreadID)
         } + retained
         if includeJournalRecovery {
-            let durable = try await usageLimitedContinuationCandidates(scanner: scanner, journal: journal)
+            let durable = try await stoppedContinuationCandidates(scanner: scanner, journal: journal)
             if selectedThreadIDs.isEmpty {
                 pool += interrupted + durable
             } else {
@@ -479,8 +607,7 @@ public actor AutoResumeCoordinator {
         _ existing: AutoResumeCandidate,
         latestTurn: JSONValue
     ) -> AutoResumeCandidate? {
-        guard latestTurn["status"]?.stringValue == "failed",
-              latestTurn["error"]?["codexErrorInfo"]?.stringValue == "usageLimitExceeded",
+        guard isStoppedByLimitOrTemporaryFailure(latestTurn),
               let latestTurnID = latestTurn["id"]?.stringValue,
               !latestTurnID.isEmpty
         else { return nil }
@@ -578,7 +705,7 @@ public actor AutoResumeCoordinator {
         return CodexTurnOutcome(
             id: id,
             status: status,
-            errorInfo: error?["codexErrorInfo"]?.stringValue,
+            errorInfo: error?["codexErrorInfo"]?.codexErrorCode,
             errorMessage: error?["message"]?.stringValue
         )
     }

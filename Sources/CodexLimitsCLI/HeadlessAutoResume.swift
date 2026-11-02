@@ -10,6 +10,7 @@ final class HeadlessAutoResume {
     private let coordinator = AutoResumeCoordinator()
     private var accounts: [SavedAccount] = []
     private var state = AutoResumeControlState()
+    private var temporaryFailures = 0
     private var lastReport: String?
 
     func run() async throws {
@@ -60,6 +61,7 @@ final class HeadlessAutoResume {
             return 60
         }
         guard !state.pendingCandidates.isEmpty else {
+            temporaryFailures = 0
             state.finishWaiting()
             saveState()
             report("No conversation has stopped on the usage limit yet. Watching…")
@@ -117,6 +119,7 @@ final class HeadlessAutoResume {
                 await self.report(message)
             }
             if resumed {
+                temporaryFailures = 0
                 state.finishWaiting()
                 saveState()
                 report("Continued the stopped conversation on \(account.email). Watching for the next limit.")
@@ -136,6 +139,12 @@ final class HeadlessAutoResume {
             report("\(email) hit its limit again. Waiting for a 5-hour limit to replenish…")
             // Even if Codex's next read contradicts the stop, retry at most once a minute.
             return 60
+        } catch AutoResumeError.temporaryCodexError(let message) {
+            // The conversation stays pending, so the next pass continues it again.
+            temporaryFailures += 1
+            let delay = AutoResumeCoordinator.temporaryFailureRetryDelay(attempt: temporaryFailures)
+            report("Codex couldn't continue: \(message) Trying again \(TimeFormatting.countdown(to: Date().addingTimeInterval(delay)))…")
+            return delay
         } catch AutoResumeError.noRecentQuotaStoppedThreads {
             report("No conversation is waiting on a usage limit. Watching…")
             return 30

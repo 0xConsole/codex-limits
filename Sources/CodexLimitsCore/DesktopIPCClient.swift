@@ -283,9 +283,9 @@ public actor DesktopIPCClient {
         }
 
         let error = turn["error"]
-        let errorInfo = error?["codexErrorInfo"]?.stringValue
+        let errorInfo = error?["codexErrorInfo"]?.codexErrorCode
             ?? error?["codex_error_info"]?.stringValue
-            ?? turn["codexErrorInfo"]?.stringValue
+            ?? turn["codexErrorInfo"]?.codexErrorCode
             ?? turn["codex_error_info"]?.stringValue
         let errorMessage = error?["message"]?.stringValue
             ?? turn["errorMessage"]?.stringValue

@@ -328,6 +328,26 @@ public actor CodexAppServerClient {
         return result["thread"] ?? result
     }
 
+    /// The conversation's goal, or nil when it has none.
+    public func threadGoal(threadID: String) async throws -> JSONValue? {
+        let result = try await request(
+            method: "thread/goal/get",
+            params: .object(["threadId": .string(threadID)])
+        )
+        guard let goal = result["goal"], goal.objectValue != nil else { return nil }
+        return goal
+    }
+
+    public func setThreadGoalStatus(threadID: String, status: String) async throws {
+        _ = try await request(
+            method: "thread/goal/set",
+            params: .object([
+                "threadId": .string(threadID),
+                "status": .string(status),
+            ])
+        )
+    }
+
     public func startTurn(
         threadID: String,
         input: [JSONValue],
@@ -429,7 +449,7 @@ public actor CodexAppServerClient {
         return CodexTurnOutcome(
             id: turnID,
             status: status,
-            errorInfo: error?["codexErrorInfo"]?.stringValue,
+            errorInfo: error?["codexErrorInfo"]?.codexErrorCode,
             errorMessage: error?["message"]?.stringValue
         )
     }
@@ -437,7 +457,7 @@ public actor CodexAppServerClient {
     public func usageLimitedCandidate(thread: JSONValue, latestTurn: JSONValue) -> AutoResumeCandidate? {
         guard let threadID = thread["id"]?.stringValue,
               latestTurn["status"]?.stringValue == "failed",
-              latestTurn["error"]?["codexErrorInfo"]?.stringValue == "usageLimitExceeded",
+              latestTurn["error"]?["codexErrorInfo"]?.codexErrorCode == "usageLimitExceeded",
               let failedTurnID = latestTurn["id"]?.stringValue
         else { return nil }
 
@@ -540,7 +560,7 @@ public actor CodexAppServerClient {
             let outcome = CodexTurnOutcome(
                 id: turnID,
                 status: status,
-                errorInfo: error?["codexErrorInfo"]?.stringValue,
+                errorInfo: error?["codexErrorInfo"]?.codexErrorCode,
                 errorMessage: error?["message"]?.stringValue
             )
             if let continuation = turnWaiters.removeValue(forKey: turnID) {

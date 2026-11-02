@@ -96,3 +96,11 @@ public enum JSONValue: Codable, Sendable, Equatable {
         }
     }
 }
+
+extension JSONValue {
+    /// A Codex error code. `codexErrorInfo` is either a plain code or, for errors that
+    /// carry an HTTP status, an object whose only key is the code.
+    public var codexErrorCode: String? {
+        stringValue ?? objectValue?.keys.first
+    }
+}

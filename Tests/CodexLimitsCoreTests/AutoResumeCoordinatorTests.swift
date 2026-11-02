@@ -172,3 +172,62 @@ func autoResumePendingInterruptedPrecedence() {
     ])
     #expect(merged == [interrupted, anotherQuota])
 }
+
+private func failedTurn(_ id: String, error: JSONValue) -> JSONValue {
+    .object([
+        "id": .string(id),
+        "status": .string("failed"),
+        "error": .object(["codexErrorInfo": error, "message": .string("failed")]),
+    ])
+}
+
+@Test("Codex error codes are read from both of their forms")
+func codexErrorCodeForms() {
+    #expect(JSONValue.string("serverOverloaded").codexErrorCode == "serverOverloaded")
+    #expect(JSONValue.object(["responseStreamDisconnected": .object(["httpStatusCode": .number(502)])]).codexErrorCode == "responseStreamDisconnected")
+    #expect(JSONValue.null.codexErrorCode == nil)
+}
+
+@Test("A temporary Codex failure keeps the conversation waiting to be continued")
+func temporaryFailureIsAContinuationBoundary() {
+    let candidate = AutoResumeCandidate(sourceThreadID: "thread", failedTurnID: "turn-1", updatedAt: nil)
+    let overloaded = failedTurn("turn-1", error: .string("serverOverloaded"))
+    let dropped = failedTurn("turn-1", error: .object(["responseStreamDisconnected": .object(["httpStatusCode": .null])]))
+    let limited = failedTurn("turn-1", error: .string("usageLimitExceeded"))
+    let blockedByPolicy = failedTurn("turn-1", error: .string("cyberPolicy"))
+    let laterTurn = failedTurn("turn-2", error: .string("serverOverloaded"))
+
+    #expect(AutoResumeCoordinator.isContinuationBoundary(overloaded, of: candidate, isInterrupted: false))
+    #expect(AutoResumeCoordinator.isContinuationBoundary(dropped, of: candidate, isInterrupted: false))
+    #expect(AutoResumeCoordinator.isContinuationBoundary(limited, of: candidate, isInterrupted: false))
+    #expect(!AutoResumeCoordinator.isContinuationBoundary(blockedByPolicy, of: candidate, isInterrupted: false))
+    #expect(!AutoResumeCoordinator.isContinuationBoundary(laterTurn, of: candidate, isInterrupted: false))
+
+    // A pending conversation follows its latest temporary failure.
+    #expect(AutoResumeCoordinator.refreshedPendingCandidate(candidate, latestTurn: laterTurn)?.failedTurnID == "turn-2")
+    #expect(AutoResumeCoordinator.refreshedPendingCandidate(candidate, latestTurn: failedTurn("turn-3", error: .string("badRequest"))) == nil)
+}
+
+@Test("Auto Resume resumes a goal the usage limit or a temporary failure stopped, and no other")
+func goalReactivationRules() {
+    let limited = failedTurn("turn", error: .string("usageLimitExceeded"))
+    let overloaded = failedTurn("turn", error: .string("serverOverloaded"))
+    let tooLong = failedTurn("turn", error: .string("contextWindowExceeded"))
+
+    #expect(AutoResumeCoordinator.goalNeedsReactivation(status: "usageLimited", latestTurn: limited))
+    #expect(AutoResumeCoordinator.goalNeedsReactivation(status: "blocked", latestTurn: overloaded))
+    #expect(!AutoResumeCoordinator.goalNeedsReactivation(status: "blocked", latestTurn: tooLong))
+    #expect(!AutoResumeCoordinator.goalNeedsReactivation(status: "paused", latestTurn: limited))
+    #expect(!AutoResumeCoordinator.goalNeedsReactivation(status: "active", latestTurn: limited))
+    #expect(!AutoResumeCoordinator.goalNeedsReactivation(status: "complete", latestTurn: limited))
+    #expect(!AutoResumeCoordinator.goalNeedsReactivation(status: nil, latestTurn: limited))
+}
+
+@Test("Retries after temporary failures back off from one minute to fifteen")
+func temporaryFailureBackoff() {
+    #expect(AutoResumeCoordinator.temporaryFailureRetryDelay(attempt: 1) == 60)
+    #expect(AutoResumeCoordinator.temporaryFailureRetryDelay(attempt: 2) == 120)
+    #expect(AutoResumeCoordinator.temporaryFailureRetryDelay(attempt: 4) == 480)
+    #expect(AutoResumeCoordinator.temporaryFailureRetryDelay(attempt: 5) == 900)
+    #expect(AutoResumeCoordinator.temporaryFailureRetryDelay(attempt: 12) == 900)
+}

@@ -6,6 +6,7 @@ extension AccountStore {
         guard canAutoResume else { return }
         autoResumeIsEnabled = true
         autoResumeState = AutoResumeControlState(isArmed: true)
+        autoResumeTemporaryFailures = 0
         autoResumeStatus = "Auto Resume is on. Checking the account signed in to Codex Desktop…"
         bannerMessage = nil
         persistAutoResumeControlState()
@@ -84,6 +85,7 @@ extension AccountStore {
 
             if autoResumeState.pendingCandidates.isEmpty {
                 let stoppedAccountID = autoResumeState.verifiedExhaustedAccountID
+                autoResumeTemporaryFailures = 0
                 autoResumeState.finishWaiting()
                 persistAutoResumeControlState()
                 if let stoppedAccountID,
@@ -177,6 +179,7 @@ extension AccountStore {
             let resumed = try result.get()
             guard autoResumeIsEnabled else { return true }
             if resumed {
+                autoResumeTemporaryFailures = 0
                 autoResumeState.finishWaiting()
                 persistAutoResumeControlState()
                 autoResumeStatus = "Resumed the stopped conversation on \(account.email). Watching for the next limit."
@@ -193,6 +196,13 @@ extension AccountStore {
             autoResumeStatus = "\(email) hit its limit again. Waiting for a 5-hour limit to replenish…"
             // Even if Codex's next read contradicts the stop, retry at most once a minute.
             await sleepAutoResume(seconds: 60)
+        } catch AutoResumeError.temporaryCodexError(let message) {
+            // The conversation stays pending, so the next pass continues it again.
+            autoResumeTemporaryFailures += 1
+            let delay = AutoResumeCoordinator.temporaryFailureRetryDelay(attempt: autoResumeTemporaryFailures)
+            let retry = TimeFormatting.countdown(to: Date().addingTimeInterval(delay))
+            autoResumeStatus = "Codex couldn't continue: \(message) Trying again \(retry)…"
+            await sleepAutoResume(seconds: delay)
         } catch AutoResumeError.noEligibleAccount {
             autoResumeStatus = "No account has a replenished 5-hour limit yet. Waiting…"
         } catch AutoResumeError.noRecentQuotaStoppedThreads {

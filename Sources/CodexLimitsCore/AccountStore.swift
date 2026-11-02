@@ -25,6 +25,7 @@ public final class AccountStore: ObservableObject {
     var autoResumeCoordinatorIsActive = false
     var autoResumeLoginAccountID: UUID?
     var autoResumeState = AutoResumeControlState()
+    var autoResumeTemporaryFailures = 0
     let autoResumeCoordinator = AutoResumeCoordinator()
     let desktopAccountSwitcher = DesktopAccountSwitcher()
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- When Codex can't run a continuation for a temporary reason, such as "Selected model is at capacity" or a dropped connection, Auto Resume keeps the conversation and tries again after 1 minute, then 2, 4 and 8, and every 15 minutes after that. Before, it gave up on the conversation.
+- If the conversation has a goal that Codex stopped because of the usage limit, Auto Resume makes the goal active again before continuing, so Codex keeps working on it. A goal that a temporary failure blocked is resumed the same way.
+- When Auto Resume runs a conversation itself, not through Codex Desktop, it keeps running while Codex works through an active goal, instead of stopping after one turn.
+- Long status messages wrap instead of being cut off.
+
 ## 0.2.0
 
 First public release.
